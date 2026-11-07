@@ -44,6 +44,7 @@ import {
   isPaymentRequiredError,
   isModelNotFoundError,
   isModelAccessForbiddenError,
+  isContentModerationError,
   isAccountSuspendedError,
   isProviderBadRequestError,
   isProviderDegradedError,
@@ -461,6 +462,27 @@ export function recordRetryableFailure(route: RouteResult, err: any, state: Fall
   if (isModelNotFoundError(err) || isModelAccessForbiddenError(err) || isContextTooLargeError(err) || err?.skipModelForRequest === true) {
     state.skipModels.add(route.modelDbId);
   }
+  // A content-moderation refusal (AnyAPI's 403 `moderation_error`, OpenAI's 400
+  // `content_policy_violation`) is a verdict on the REQUEST's content, not on the
+  // key or the model: both are healthy, and the same body would be refused by a
+  // sibling key too. Rule the model out for this request — the next provider's
+  // moderation may well accept the prompt — but record NOTHING durable: no
+  // cooldown, no penalty, no limit learning. Classified as tier-forbidden (the
+  // #256 path) this took a 24h bench the cooldown-probe never revisits, a scorer
+  // demotion, and answered the client with a 429 that promised a recovery which
+  // could never come.
+  if (isContentModerationError(err)) {
+    state.skipModels.add(route.modelDbId);
+    state.skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+    // Break any empty-completion streak the same way a normally-penalized
+    // failure would (the model produced no completion this time either).
+    consumeSkipBenchExemption(route, err);
+    // Exempt from the per-request breaker (the `true` return): a moderation
+    // refusal is a verdict on the prompt, not evidence that the pool is sick,
+    // so it must not stop the chain from trying the next provider — that one
+    // may well accept the same prompt.
+    return true;
+  }
   // A stale CATALOG (not a single dead model) answers model-not-found on every
   // sibling model in a row: NavyAI served 24 models over one session, 0 ok,
   // each re-paying a 2.5–10s round trip (#1218). The per-model skip above
@@ -717,6 +739,7 @@ export type AttemptErrorClass =
   | 'daily_quota_exhausted'
   | 'model_not_found'
   | 'forbidden'
+  | 'content_filtered'
   | 'context_too_large'
   | 'provider_bad_request'
   | 'empty_completion'
@@ -739,6 +762,9 @@ export function classifyAttemptError(err: any): AttemptErrorClass {
   if (isPaymentRequiredError(err)) return 'out_of_credits';
   if (isDailyQuotaExhaustedError(err)) return 'daily_quota_exhausted';
   if (isModelNotFoundError(err)) return 'model_not_found';
+  // Before the forbidden check: same 403 status, opposite meaning (the CONTENT
+  // was refused, the model is reachable).
+  if (isContentModerationError(err)) return 'content_filtered';
   if (isModelAccessForbiddenError(err)) return 'forbidden';
   // Before the bad-request check: OpenAI-compat context errors arrive as
   // "API error 400: This model's maximum context length is …", which the
@@ -1039,6 +1065,22 @@ export function exhaustedRetryError(lastError: any, maxRetries?: number, ctx?: E
       code: 'provider_degraded',
       message: `The routed provider reported the model's hosted deployment as temporarily degraded${budgetNote}. ` +
         `This is a provider-side condition; retry later or route to another provider.${trail} Last error: ${safeLastError}`,
+    };
+  }
+
+  // Every routed provider refused the CONTENT. Waiting cannot help and no
+  // provider is sick, so this is the caller's 400 — not the 429 the old
+  // tier-forbidden classification produced ("All models rate-limited ... Soonest
+  // cooldown reset ~5h" for a prompt no amount of waiting would ever serve).
+  if (everyAttempt('content_filtered')) {
+    return {
+      kind: 'bad_request',
+      status: 400,
+      type: 'invalid_request_error',
+      code: 'content_filtered',
+      message: `Every routed provider refused the request on content-moderation grounds (${attempts.length} attempt(s))${budgetNote}. ` +
+        'The prompt was flagged by the upstream moderation filter, so retrying it unchanged will keep failing; ' +
+        `reword or remove the flagged material. No provider or model was benched for this.${trail} Last error: ${safeLastError}`,
     };
   }
 

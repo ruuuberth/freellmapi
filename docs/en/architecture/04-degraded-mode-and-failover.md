@@ -201,6 +201,7 @@ interface FallbackHooks {
 | 401 invalid key | key | 5 min | no | no |
 | 402 payment required | **key, every model of the platform** (#1239) | 24h | no | no |
 | 403 model forbidden | **model** | 24h | no | no |
+| content moderation (403/400 moderation_error, content_policy_violation) | model (this request only) | — | no | no |
 | 429 daily exhausted | model+key | until midnight / Retry-After | **heavy (3)** | yes |
 | 429 transient (rpm/tpm) | key | 90s / ladder | light (1) | yes |
 | 5xx / timeout / transport | **platform** (#788) | 90s / ladder | light (1) | no |
