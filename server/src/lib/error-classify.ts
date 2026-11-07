@@ -61,6 +61,13 @@ export function isRetryableError(err: any): boolean {
     // instead of 502-ing the whole request. Paired with isModelAccessForbiddenError
     // to rule the model out for this request and a day-long bench. See issue #256.
     || isModelAccessForbiddenError(err)
+    // A content-moderation refusal fails over too, but for the opposite reason:
+    // the model is reachable and another provider's moderation may accept the
+    // same prompt (false positives are provider-specific). Paired with
+    // isContentModerationError in recordRetryableFailure, which skips the model
+    // for this request but records NO bench and NO penalty — the key and model
+    // are healthy, only the content was refused.
+    || isContentModerationError(err)
     // 400: one provider may reject parameters another accepts (e.g. max_tokens
     // limits, unsupported params). The matching pattern is "api error 400"
     // which comes from the OpenAI-compat provider's error formatting, not
@@ -636,13 +643,61 @@ export function isAccountSuspendedError(err: any): boolean {
     || msg.includes('due to abuse');
 }
 
+// ── Content-moderation rejections (a 403 that is NOT a tier gate) ────────────
+// A 403 does not always mean "this key's tier can't reach this model". AnyAPI
+// answers a flagged PROMPT with 403 + `type: "moderation_error"`
+// ("Your request was flagged by content moderation"), and OpenAI-shaped
+// gateways use 400 + code `content_policy_violation` for the same verdict. The
+// model and the key are both fine: the CONTENT is what was refused.
+//
+// Classified as model-forbidden (#256 semantics) that cost a 24h 'tier' bench
+// the cooldown-probe never revisits, a scorer penalty, and a client-facing 429
+// "All models rate-limited" for a request no amount of waiting can fix.
+//
+// Status-gated so provider wording alone can never claim it: only 403, 400, 422
+// or a status-less error qualify. A 429/402/5xx that happens to mention
+// moderation keeps its own, more specific classification.
+const MODERATION_ERROR_TYPES = new Set([
+  'moderation_error',
+  'moderation_blocked',
+  'content_policy_violation',
+  'content_filter',
+  'content_moderation',
+]);
+
+const MODERATION_PHRASES = [
+  'flagged by content moderation',
+  'blocked by content moderation',
+  'content moderation',
+  'content_policy_violation',
+  'content policy violation',
+  'violates our content policy',
+  'violates the content policy',
+];
+
+export function isContentModerationError(err: any): boolean {
+  // An account-level suspension is also a 403 whose wording is easy to confuse
+  // with a content verdict; isAccountSuspendedError owns that case.
+  if (isAccountSuspendedError(err)) return false;
+  const status = typeof err?.status === 'number' ? err.status : 0;
+  if (status !== 0 && status !== 400 && status !== 403 && status !== 422) return false;
+  const type = typeof err?.upstreamErrorType === 'string' ? err.upstreamErrorType.toLowerCase() : '';
+  if (type && MODERATION_ERROR_TYPES.has(type)) return true;
+  const msg = (err?.message ?? '').toLowerCase();
+  return MODERATION_PHRASES.some(phrase => msg.includes(phrase));
+}
+
 // A 403 Forbidden returned for a specific model behind an otherwise-valid key.
 // Drives the same whole-model skip as a 404: every key on this platform's tier
 // would be forbidden the same model, so rule it out for the rest of the request
 // rather than trying it again with a sibling key. Distinct from a dead key —
 // validateKey returns false on 401/403, so the health checker disables genuinely
 // forbidden keys; a 403 reaching here is model-not-on-this-tier. See issue #256.
+// A content-moderation 403 is NOT this: same status, opposite meaning (the
+// prompt was refused, the model is reachable), and isContentModerationError
+// claims it first.
 export function isModelAccessForbiddenError(err: any): boolean {
+  if (isContentModerationError(err)) return false;
   if (err?.status === 403) return true;
   const msg = (err?.message ?? '').toLowerCase();
   if (msg.includes('403') || msg.includes('forbidden')) return true;

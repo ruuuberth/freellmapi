@@ -125,6 +125,7 @@ Provider-stated reset wins; everything past it is our guess.
 |---------|----------|--------|
 | 402 Payment Required | 24 h | `credit` |
 | 403 Model Forbidden | 24 h | `tier` |
+| Content moderation (403/400 `moderation_error`, `content_policy_violation`) | none — request-scoped only | — |
 | Daily quota exhausted (explicit) | until UTC midnight / Retry-After | `authoritative` |
 | Auth failure (401) | 5 min (health cycle) | `heuristic` |
 | Empty completion streak (≥3) | normal ladder | `heuristic` |

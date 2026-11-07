@@ -15,7 +15,7 @@ import { logRequest } from '../lib/request-log.js';
 import {
   isRetryableError, isRateLimitSignal, isPaymentRequiredError,
   isModelNotFoundError, isModelAccessForbiddenError,
-  isContextTooLargeError, isDailyQuotaExhaustedError,
+  isContextTooLargeError, isDailyQuotaExhaustedError, isContentModerationError,
 } from '../lib/error-classify.js';
 import { contentToString, stripImagesFromMessages } from '../lib/content.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -369,6 +369,14 @@ export async function runModelCall(
         noteContextTooLarge(route, err, skipModels);
         continue;
       }
+      // A content-moderation refusal is the CONTENT's verdict, not the key's or
+      // the model's: rule this model out for the call and move on, with no
+      // cooldown and no penalty (mirrors recordRetryableFailure).
+      if (isContentModerationError(err)) {
+        skipModels.add(route.modelDbId);
+        skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
+        continue;
+      }
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
@@ -477,6 +485,14 @@ async function runJudgeStreaming(
       }
       if (isContextTooLargeError(err)) {
         noteContextTooLarge(route, err, skipModels);
+        continue;
+      }
+      // A content-moderation refusal is the CONTENT's verdict, not the key's or
+      // the model's: rule this model out for the call and move on, with no
+      // cooldown and no penalty (mirrors recordRetryableFailure).
+      if (isContentModerationError(err)) {
+        skipModels.add(route.modelDbId);
+        skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         continue;
       }
       if (isRetryableError(err)) {
