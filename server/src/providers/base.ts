@@ -21,6 +21,11 @@ export interface ProviderHttpError extends Error {
   retryAfterMs?: number;
   /** Explicit daily-window violation from structured upstream quota details. */
   dailyQuotaExhausted?: boolean;
+  /** The upstream's own structured error classification (`error.type` in an
+   *  OpenAI-shaped body, e.g. AnyAPI's "moderation_error"), lowercased. Only a
+   *  short string is kept — the body itself is never retained — so classifiers
+   *  can read the provider's vocabulary instead of guessing from prose. */
+  upstreamErrorType?: string;
 }
 
 /** Upper bound on a provider-supplied back-off. A malformed or hostile
@@ -144,17 +149,37 @@ function safeStringify(value: unknown): string {
  *  provider's explicit hint when it sets the cooldown.
  *
  *  `body` is the already-parsed error payload the caller used to build
- *  `message`. Only a delay is read out of it and only a number is kept — the
- *  body itself is never retained, so nothing extra reaches a log or the
- *  attempt trace. The Retry-After header still wins when both are present: it
- *  is the standard channel, and preferring it keeps existing behavior exactly
- *  as it was. */
+ *  `message`. Two things are read out of it: a delay (a number only) and the
+ *  provider's structured `error.type` (a short string only). The body itself is
+ *  never retained, so nothing extra reaches a log or the attempt trace. The
+ *  Retry-After header still wins when both are present: it is the standard
+ *  channel, and preferring it keeps existing behavior exactly as it was. */
 export function providerHttpError(res: Response, message: string, body?: unknown): ProviderHttpError {
   const err = new Error(message) as ProviderHttpError;
   err.status = res.status;
   const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after')) ?? parseStatedRetryMs(body);
   if (retryAfterMs !== undefined) err.retryAfterMs = retryAfterMs;
+  const errorType = readErrorType(body);
+  if (errorType !== undefined) err.upstreamErrorType = errorType;
   return err;
+}
+
+/** The provider's own error classification, when it sent one: `error.type` on
+ *  an OpenAI-shaped body (`{"error":{"type":"moderation_error",...}}`), or a
+ *  top-level `type` on the flatter shapes some gateways use. Kept short and
+ *  lowercased — this is a discriminator, not prose. Tencent-style `code`-only
+ *  bodies deliberately do not qualify: `code` collides with numeric HTTP codes.
+ *  Exported for adapters that build their own errors (see providers/google.ts). */
+export function readErrorType(body: unknown): string | undefined {
+  if (body === null || typeof body !== 'object') return undefined;
+  const record = body as Record<string, unknown>;
+  const nested = record.error;
+  const candidate = nested !== null && typeof nested === 'object'
+    ? (nested as Record<string, unknown>).type
+    : record.type;
+  if (typeof candidate !== 'string') return undefined;
+  const trimmed = candidate.trim().toLowerCase();
+  return trimmed.length > 0 && trimmed.length <= 64 ? trimmed : undefined;
 }
 
 // Extended sampling knobs (top_k, seed, penalties, logit_bias, logprobs,
